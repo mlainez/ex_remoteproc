@@ -18,9 +18,8 @@ defmodule ExRemoteproc.MixProject do
     ]
   end
 
-  defp deps do
-    [
-      {:ex_rmtfs, github: "mlainez/ex_rmtfs"}
-    ]
-  end
+  # No runtime deps: kicking a remoteproc only needs sysfs and the firmware
+  # in /lib/firmware. It does not need rmtfs (which serves modem EFS, not
+  # remoteproc firmware), so :ex_rmtfs is intentionally not a dependency.
+  defp deps, do: []
 end
