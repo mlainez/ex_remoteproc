@@ -4,15 +4,12 @@ defmodule ExRemoteproc.Application do
 
   @impl true
   def start(_type, _args) do
-    names = Application.get_env(:ex_remoteproc, :start, [:adsp])
+    children =
+      case Application.get_env(:ex_remoteproc, :start, [:adsp]) do
+        [] -> []
+        names -> [{ExRemoteproc.Starter, names}]
+      end
 
-    children = [
-      {ExRemoteproc.Starter, names}
-    ]
-
-    Supervisor.start_link(children,
-      strategy: :one_for_one,
-      name: ExRemoteproc.Supervisor
-    )
+    Supervisor.start_link(children, strategy: :one_for_one, name: ExRemoteproc.Supervisor)
   end
 end

@@ -1,93 +1,88 @@
 defmodule ExRemoteproc.Starter do
   @moduledoc """
-  Kicks the configured Qualcomm remoteprocs into `running` after rmtfs is up.
+  Kicks the configured remoteprocs into `running` once at boot.
 
-  On MSM8953/SDM632 the ADSP firmware loads at probe time (kernel ~t+2.5 s),
-  before the squashfs rootfs is mounted, so its `qcom/.../adsp.mbn` lookup
-  fails with -2 and the remoteproc stays `offline`. Once userspace is up,
-  rmtfs needs to be serving on QRTR *before* we re-trigger ADSP boot so the
-  ADSP firmware can find its shared storage.
+  Why this is needed on the Fairphone 3 (MSM8953/SDM632): the ADSP driver
+  (`qcom_q6v5_pas`, built into the kernel) probes a couple of seconds into
+  boot and asks the kernel firmware loader for its firmware under
+  `/lib/firmware`. At that point the root filesystem
+  isn't mounted yet, the request fails with `-ENOENT` and the remoteproc
+  stays `offline`. Once userspace is running `/lib/firmware` is available,
+  and writing `start` to its `state` file boots it.
 
-  ex_remoteproc depends on `:ex_rmtfs` in mix.exs, so OTP guarantees
-  ex_rmtfs is started first. This Starter then writes `start` to
-  `/sys/class/remoteproc/<n>/state` for each name in the config.
+  This does not depend on `rmtfs`: rmtfs serves the modem's EFS partitions,
+  not remoteproc firmware, and the ADSP is loaded directly by the kernel.
+
+  For each configured name the Starter reads the state via
+  `ExRemoteproc.state/1`; if it is not `running` it calls
+  `ExRemoteproc.kick/1`. A remoteproc that doesn't exist yet (its driver
+  may still be probing) or whose kick fails is retried a few times, after
+  1, 2, 4 and 8 seconds, then given up on with a warning. Nothing here ever
+  crashes.
   """
   use GenServer
   require Logger
 
-  @sysfs "/sys/class/remoteproc"
+  @retry_delays [1_000, 2_000, 4_000, 8_000]
 
+  @doc false
   def start_link(names) do
     GenServer.start_link(__MODULE__, names, name: __MODULE__)
   end
 
   @impl true
   def init(names) do
-    {:ok, %{names: names}, {:continue, :kick_all}}
+    {:ok, %{}, {:continue, {:kick, Enum.map(names, &to_string/1), @retry_delays}}}
   end
 
   @impl true
-  def handle_continue(:kick_all, %{names: names} = state) do
-    # Give ex_rmtfs a moment to bind its QRTR socket before the ADSP
-    # firmware starts hitting it for storage requests.
-    Process.sleep(500)
-    Enum.each(names, &kick/1)
-    {:noreply, state}
+  def handle_continue({:kick, names, delays}, state) do
+    {:noreply, kick_all(names, delays, state)}
   end
 
-  defp kick(name) do
-    target = to_string(name)
+  @impl true
+  def handle_info({:kick, names, delays}, state) do
+    {:noreply, kick_all(names, delays, state)}
+  end
 
-    case find(target) do
-      nil ->
-        Logger.warning("ex_remoteproc: no remoteproc named #{inspect(target)}")
+  defp kick_all(names, delays, state) do
+    failed = Enum.reject(names, &ensure_running/1)
 
-      path ->
-        do_kick(target, path)
+    case {failed, delays} do
+      {[], _} ->
+        :ok
+
+      {_, [delay | rest]} ->
+        Process.send_after(self(), {:kick, failed, rest}, delay)
+
+      {_, []} ->
+        Logger.warning("ex_remoteproc: giving up on #{inspect(failed)}")
     end
+
+    state
   end
 
-  defp do_kick(name, path) do
-    state_path = Path.join(path, "state")
+  # Returns true when the remoteproc is running (or was just started).
+  defp ensure_running(name) do
+    case ExRemoteproc.state(name) do
+      {:ok, "running"} ->
+        Logger.info("ex_remoteproc: #{name} already running")
+        true
 
-    case File.read(state_path) do
-      {:ok, content} ->
-        case String.trim(content) do
-          "running" ->
-            Logger.info("ex_remoteproc: #{name} already running")
+      {:ok, current} ->
+        case ExRemoteproc.kick(name) do
+          :ok ->
+            Logger.info("ex_remoteproc: kicked #{name} (was #{current})")
+            true
 
-          current ->
-            case File.write(state_path, "start") do
-              :ok ->
-                Logger.info("ex_remoteproc: kicked #{name} (was #{current})")
-
-              {:error, reason} ->
-                Logger.warning("ex_remoteproc: kick #{name} failed: #{inspect(reason)}")
-            end
+          {:error, reason} ->
+            Logger.warning("ex_remoteproc: kick #{name} failed: #{inspect(reason)}")
+            false
         end
 
       {:error, reason} ->
-        Logger.warning("ex_remoteproc: cannot read #{state_path}: #{inspect(reason)}")
-    end
-  end
-
-  defp find(target) do
-    case File.ls(@sysfs) do
-      {:ok, entries} ->
-        Enum.find_value(entries, fn entry ->
-          path = Path.join(@sysfs, entry)
-
-          case File.read(Path.join(path, "name")) do
-            {:ok, content} ->
-              if String.trim(content) == target, do: path
-
-            _ ->
-              nil
-          end
-        end)
-
-      _ ->
-        nil
+        Logger.warning("ex_remoteproc: #{name}: #{inspect(reason)}")
+        false
     end
   end
 end
